@@ -91,6 +91,7 @@ typedef struct {
 #define ASYNC_OP_FAILED 65
 
 ASYNC_API extern zend_bool async_cli;
+ASYNC_API extern char async_ssl_config_file[MAXPATHLEN];
 
 ASYNC_API extern zend_class_entry *async_awaitable_ce;
 ASYNC_API extern zend_class_entry *async_context_ce;
@@ -665,6 +666,9 @@ struct _async_tcp_socket {
 
 	/* UV TCP handle. */
 	uv_tcp_t handle;
+
+	char *name;
+	zend_long port;
 
 	/* Is set if EOF has been red. */
 	zend_bool eof;

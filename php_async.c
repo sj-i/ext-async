@@ -27,6 +27,7 @@
 ZEND_DECLARE_MODULE_GLOBALS(async)
 
 zend_bool async_cli;
+char async_ssl_config_file[MAXPATHLEN];
 
 static void async_execute_ex(zend_execute_data *exec);
 static void (*orig_execute_ex)(zend_execute_data *exec);
@@ -107,18 +108,28 @@ PHP_MINIT_FUNCTION(async)
 	}
 
 #ifdef HAVE_ASYNC_SSL
+	char *file;
+
 #if OPENSSL_VERSION_NUMBER < 0x10100000L || defined (LIBRESSL_VERSION_NUMBER)
-	OPENSSL_config(NULL);
 	SSL_library_init();
-	OpenSSL_add_all_ciphers();
-	OpenSSL_add_all_digests();
-	OpenSSL_add_all_algorithms();
 	SSL_load_error_strings();
-	ERR_load_BIO_strings();
-	ERR_load_crypto_strings();
+	OPENSSL_config(NULL);
 #else
 	OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, NULL);
 #endif
+
+	file = getenv("OPENSSL_CONF");
+
+	if (file == NULL) {
+		file = getenv("SSLEAY_CONF");
+	}
+
+	if (file == NULL) {
+		snprintf(async_ssl_config_file, sizeof(async_ssl_config_file), "%s/%s", X509_get_default_cert_area(), "openssl.cnf");
+	} else {
+		strlcpy(async_ssl_config_file, file, sizeof(async_ssl_config_file));
+	}
+
 #endif
 
 	async_awaitable_ce_register();

@@ -43,6 +43,8 @@ static void write_to_socket(async_tcp_socket *socket, uv_buf_t *buffer, zend_exe
 
 #ifdef HAVE_ASYNC_SSL
 
+static int async_index;
+
 static int ssl_error_continue(async_tcp_socket *socket, int code)
 {
 	int error = SSL_get_error(socket->ssl, code);
@@ -92,6 +94,99 @@ static int ssl_feed_data(async_tcp_socket *socket)
 	return 0;
 }
 
+static zend_bool ssl_match_hostname(const char *subjectname, const char *certname)
+{
+	char *wildcard = NULL;
+	ptrdiff_t prefix_len;
+	size_t suffix_len, subject_len;
+
+	if (strcasecmp(subjectname, certname) == 0) {
+		return 1;
+	}
+
+	if (!(wildcard = strchr(certname, '*')) || memchr(certname, '.', wildcard - certname)) {
+		return 0;
+	}
+
+	prefix_len = wildcard - certname;
+	if (prefix_len && strncasecmp(subjectname, certname, prefix_len) != 0) {
+		return 0;
+	}
+
+	suffix_len = strlen(wildcard + 1);
+	subject_len = strlen(subjectname);
+
+	if (suffix_len <= subject_len) {
+		return strcasecmp(wildcard + 1, subjectname + subject_len - suffix_len) == 0 && memchr(subjectname + prefix_len, '.', subject_len - suffix_len - prefix_len) == NULL;
+	}
+
+	return strcasecmp(wildcard + 2, subjectname + subject_len - suffix_len);
+}
+
+static int ssl_verify_callback(int preverify, X509_STORE_CTX *ctx)
+{
+	async_tcp_socket *socket;
+	SSL *ssl;
+
+	X509 *cert;
+	X509_NAME_ENTRY *entry;
+	ASN1_STRING *str;
+
+	char *cn;
+
+	int depth;
+	int err;
+	int i;
+
+	cert = X509_STORE_CTX_get_current_cert(ctx);
+	depth = X509_STORE_CTX_get_error_depth(ctx);
+	err = X509_STORE_CTX_get_error(ctx);
+
+	ssl = X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
+	socket = (async_tcp_socket *) SSL_get_ex_data(ssl, async_index);
+
+	if (!cert || err || socket == NULL) {
+		return preverify;
+	}
+
+	if (depth == 0) {
+		if ((i = X509_NAME_get_index_by_NID(X509_get_subject_name((X509 *) cert), NID_commonName, -1)) < 0) {
+			return 0;
+		}
+
+		if (NULL == (entry = X509_NAME_get_entry(X509_get_subject_name((X509 *) cert), i))) {
+			return 0;
+		}
+
+		if (NULL == (str = X509_NAME_ENTRY_get_data(entry))) {
+			return 0;
+		}
+
+		cn = (char *) ASN1_STRING_data(str);
+
+		if ((size_t) ASN1_STRING_length(str) != strlen(cn)) {
+			return 0;
+		}
+
+		if (!ssl_match_hostname(socket->name, cn)) {
+			return 0;
+		}
+	}
+
+	return preverify;
+}
+
+static int ssl_passphrase_cb(char *buf, int size, int rwflag, void *obj)
+{
+//	async_tcp_socket *socket;
+//
+//	socket = (async_tcp_socket *) obj;
+
+	memcpy(buf, "localhost", sizeof("localhost"));
+
+	return sizeof("localhost")-1;
+}
+
 #endif
 
 
@@ -103,6 +198,7 @@ static void socket_disposed(uv_handle_t *handle)
 
 	if (socket->buffer.base != NULL) {
 		efree(socket->buffer.base);
+		socket->buffer.base = NULL;
 	}
 
 	OBJ_RELEASE(&socket->std);
@@ -400,6 +496,8 @@ ZEND_METHOD(Socket, connect)
 	}
 
 	socket = async_tcp_socket_object_create();
+	socket->name = name;
+	socket->port = port;
 
 	code = uv_ip4_addr(Z_STRVAL_P(&ip), (int) port, &dest);
 
@@ -805,30 +903,53 @@ ZEND_METHOD(Socket, encrypt)
 	zend_throw_error(NULL, "Async extension was not compiled with SSL support");
 #else
 	async_tcp_socket *socket;
+	zend_bool server;
+
+	X509 *cert;
 
 	uv_buf_t buffer[1];
+	char *cadir;
 
 	size_t len;
 	int options;
 	int code;
 	long result;
 
-	ZEND_PARSE_PARAMETERS_NONE();
+	server = 0;
+
+	ZEND_PARSE_PARAMETERS_START_EX(ZEND_PARSE_PARAMS_THROW, 0, 1)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_BOOL(server)
+	ZEND_PARSE_PARAMETERS_END();
 
 	socket = (async_tcp_socket *) Z_OBJ_P(getThis());
 
-	options = SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION;
-	options |= SSL_OP_NO_TICKET;
+	options = SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3;
+	options |= SSL_OP_NO_COMPRESSION | SSL_OP_NO_TICKET;
 	options &= ~SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS;
 
-	socket->ctx = SSL_CTX_new(SSLv23_client_method());
+	socket->ctx = SSL_CTX_new(SSLv23_method());
 
 	SSL_CTX_set_options(socket->ctx, options);
-	SSL_CTX_set_verify(socket->ctx, SSL_VERIFY_NONE, NULL);
 	SSL_CTX_set_cipher_list(socket->ctx, "HIGH:!SSLv2:!aNULL:!eNULL:!EXPORT:!DES:!MD5:!RC4:!ADH");
 
-	socket->ssl = SSL_new(socket->ctx);
+	if (server) {
+		SSL_CTX_set_verify(socket->ctx, SSL_VERIFY_NONE, NULL);
+		SSL_CTX_use_certificate_file(socket->ctx, "/vagrant/examples/cert/localhost.crt", SSL_FILETYPE_PEM);
+		SSL_CTX_use_PrivateKey_file(socket->ctx, "/vagrant/examples/cert/localhost.key", SSL_FILETYPE_PEM);
+	} else {
+		SSL_CTX_set_verify(socket->ctx, SSL_VERIFY_PEER, ssl_verify_callback);
+		SSL_CTX_set_verify_depth(socket->ctx, 10);
+	}
 
+	SSL_CTX_set_default_passwd_cb_userdata(socket->ctx, socket);
+	SSL_CTX_set_default_passwd_cb(socket->ctx, ssl_passphrase_cb);
+
+	// Use default X509 cert directory.
+	cadir = getenv(X509_get_default_cert_dir_env());
+	SSL_CTX_load_verify_locations(socket->ctx, NULL, (cadir == NULL) ? X509_get_default_cert_dir() : cadir);
+
+	socket->ssl = SSL_new(socket->ctx);
 	socket->rbio = BIO_new(BIO_s_mem());
 	socket->wbio = BIO_new(BIO_s_mem());
 
@@ -836,18 +957,26 @@ ZEND_METHOD(Socket, encrypt)
 	BIO_set_mem_eof_return(socket->wbio, -1);
 
 	SSL_set_bio(socket->ssl, socket->rbio, socket->wbio);
-	SSL_set_connect_state(socket->ssl);
 	SSL_set_read_ahead(socket->ssl, 1);
+	SSL_set_ex_data(socket->ssl, async_index, socket);
+
+	if (server) {
+		SSL_set_accept_state(socket->ssl);
+	} else {
+		SSL_set_connect_state(socket->ssl);
+	}
 
 #ifdef SSL_MODE_RELEASE_BUFFERS
 	SSL_set_mode(socket->ssl, SSL_get_mode(socket->ssl) | SSL_MODE_RELEASE_BUFFERS);
 #endif
 
-	code = SSL_do_handshake(socket->ssl);
+	if (!server) {
+		code = SSL_do_handshake(socket->ssl);
 
-	if (!ssl_error_continue(socket, code)) {
-		zend_throw_error(NULL, "SSL handshake failed [%d]: %s", code, ERR_reason_error_string(code));
-		return;
+		if (!ssl_error_continue(socket, code)) {
+			zend_throw_error(NULL, "SSL handshake failed [%d]: %s", code, ERR_reason_error_string(code));
+			return;
+		}
 	}
 
 	zval retval;
@@ -860,6 +989,10 @@ ZEND_METHOD(Socket, encrypt)
 			write_to_socket(socket, buffer, execute_data);
 
 			efree(buffer[0].base);
+
+			if (UNEXPECTED(EG(exception))) {
+				return;
+			}
 		}
 
 		uv_read_start((uv_stream_t *) &socket->handle, socket_read_alloc, socket_read);
@@ -867,6 +1000,15 @@ ZEND_METHOD(Socket, encrypt)
 		ZVAL_UNDEF(&retval);
 		async_task_suspend(&socket->reads, &retval, execute_data, NULL);
 		zval_ptr_dtor(&retval);
+
+		if (UNEXPECTED(EG(exception))) {
+			return;
+		}
+
+		if (socket->eof) {
+			zend_throw_error(NULL, "SSL handshake failed due to closed socket");
+			return;
+		}
 
 		code = SSL_do_handshake(socket->ssl);
 
@@ -876,21 +1018,23 @@ ZEND_METHOD(Socket, encrypt)
 		}
 	}
 
-	X509 *cert = SSL_get_peer_certificate(socket->ssl);
+	if (!server) {
+		cert = SSL_get_peer_certificate(socket->ssl);
 
-	if (cert == NULL) {
+		if (cert == NULL) {
+			X509_free(cert);
+			zend_throw_error(NULL, "Failed to access server SSL certificate");
+			return;
+		}
+
 		X509_free(cert);
-		zend_throw_error(NULL, "Failed to access server SSL certificate");
-		return;
-	}
 
-	X509_free(cert);
+		result = SSL_get_verify_result(socket->ssl);
 
-	result = SSL_get_verify_result(socket->ssl);
-
-	if (X509_V_OK != result) {
-//		zend_throw_error(NULL, "Failed to verify server SSL certificate [%ld]: %s", result, X509_verify_cert_error_string(result));
-//		return;
+		if (X509_V_OK != result) {
+			zend_throw_error(NULL, "Failed to verify server SSL certificate [%ld]: %s", result, X509_verify_cert_error_string(result));
+			return;
+		}
 	}
 
 	code = ssl_feed_data(socket);
@@ -939,6 +1083,7 @@ ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_tcp_socket_write_stream, 0, 0, Co
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_tcp_socket_encrypt, 0, 0, IS_VOID, 0)
+	ZEND_ARG_TYPE_INFO(0, server, _IS_BOOL, 1)
 ZEND_END_ARG_INFO()
 
 static const zend_function_entry async_tcp_socket_functions[] = {
@@ -1393,6 +1538,10 @@ void async_tcp_ce_register()
 	async_tcp_server_handlers.dtor_obj = async_tcp_server_object_dtor;
 	async_tcp_server_handlers.free_obj = async_tcp_server_object_destroy;
 	async_tcp_server_handlers.clone_obj = NULL;
+
+#ifdef HAVE_ASYNC_SSL
+	async_index = SSL_get_ex_new_index(0, "ext-async", NULL, NULL, NULL);
+#endif
 }
 
 
