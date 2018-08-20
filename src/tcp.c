@@ -39,6 +39,7 @@ static async_tcp_socket *async_tcp_socket_object_create();
 static async_tcp_socket_reader *async_tcp_socket_reader_object_create(async_tcp_socket *socket);
 static async_tcp_socket_writer *async_tcp_socket_writer_object_create(async_tcp_socket *socket);
 
+static void write_to_socket(async_tcp_socket *socket, uv_buf_t *buffer, zend_execute_data *execute_data);
 
 #ifdef HAVE_ASYNC_SSL
 
@@ -269,6 +270,43 @@ static void server_connected(uv_stream_t *stream, int status)
 
 		async_awaitable_trigger_next_continuation(&server->accepts, &data, 1);
 	}
+}
+
+static void write_to_socket(async_tcp_socket *socket, uv_buf_t *buffer, zend_execute_data *execute_data)
+{
+	uv_write_t write;
+	zval retval;
+
+	int result;
+
+	while (socket->writes.first == NULL) {
+		result = uv_try_write((uv_stream_t *) &socket->handle, buffer, 1);
+
+		if (result == UV_EAGAIN) {
+			break;
+		} else if (result < 0) {
+			zend_throw_exception_ex(async_stream_exception_ce, 0, "Socket write error: %s", uv_strerror(result));
+			return;
+		}
+
+		if (result == buffer[0].len) {
+			return;
+		}
+
+		buffer[0].base += result;
+		buffer[0].len -= result;
+	}
+
+	result = uv_write(&write, (uv_stream_t *) &socket->handle, buffer, 1, socket_write);
+
+	if (UNEXPECTED(result != 0)) {
+		zend_throw_exception_ex(async_stream_exception_ce, 0, "Failed to queue socket write: %s", uv_strerror(result));
+		return;
+	}
+
+	ZVAL_UNDEF(&retval);
+	async_task_suspend(&socket->writes, &retval, execute_data, NULL);
+	zval_ptr_dtor(&retval);
 }
 
 
@@ -676,10 +714,7 @@ ZEND_METHOD(Socket, readStream)
 static inline void socket_call_write(async_tcp_socket *socket, zval *return_value, zend_execute_data *execute_data)
 {
 	zend_string *data;
-	uv_write_t write;
 	uv_buf_t buffer[1];
-
-	int result;
 
 	ZEND_PARSE_PARAMETERS_START_EX(ZEND_PARSE_PARAMS_THROW, 1, 1)
 		Z_PARAM_STR(data)
@@ -720,17 +755,13 @@ static inline void socket_call_write(async_tcp_socket *socket, zval *return_valu
 
 				BIO_read(socket->wbio, buffer[0].base, len);
 
-				result = uv_write(&write, (uv_stream_t *) &socket->handle, buffer, 1, socket_write);
-
-				if (UNEXPECTED(result != 0)) {
-					efree(buffer[0].base);
-					zend_throw_exception_ex(async_stream_exception_ce, 0, "Failed to queue socket write: %s", uv_strerror(result));
-					return;
-				}
-
-				async_task_suspend(&socket->writes, return_value, execute_data, NULL);
+				write_to_socket(socket, buffer, execute_data);
 
 				efree(buffer[0].base);
+
+				if (UNEXPECTED(EG(exception))) {
+					return;
+				}
 			}
 		}
 
@@ -741,36 +772,7 @@ static inline void socket_call_write(async_tcp_socket *socket, zval *return_valu
 	buffer[0].base = ZSTR_VAL(data);
 	buffer[0].len = ZSTR_LEN(data);
 
-	// Attempt a non-blocking write first before queueing up writes.
-	if (socket->writes.first == NULL) {
-		do {
-			result = uv_try_write((uv_stream_t *) &socket->handle, buffer, 1);
-
-			if (result == UV_EAGAIN) {
-				break;
-			} else if (result < 0) {
-				zend_throw_exception_ex(async_stream_exception_ce, 0, "Socket write error: %s", uv_strerror(result));
-
-				return;
-			}
-
-			if (result == buffer[0].len) {
-				return;
-			}
-
-			buffer[0].base += result;
-			buffer[0].len -= result;
-		} while (1);
-	}
-
-	result = uv_write(&write, (uv_stream_t *) &socket->handle, buffer, 1, socket_write);
-
-	if (UNEXPECTED(result != 0)) {
-		zend_throw_exception_ex(async_stream_exception_ce, 0, "Failed to queue socket write: %s", uv_strerror(result));
-		return;
-	}
-
-	async_task_suspend(&socket->writes, return_value, execute_data, NULL);
+	write_to_socket(socket, buffer, execute_data);
 }
 
 ZEND_METHOD(Socket, write)
@@ -804,7 +806,6 @@ ZEND_METHOD(Socket, encrypt)
 #else
 	async_tcp_socket *socket;
 
-	uv_write_t write;
 	uv_buf_t buffer[1];
 
 	size_t len;
@@ -856,11 +857,7 @@ ZEND_METHOD(Socket, encrypt)
 			buffer[0].base = emalloc(len);
 			buffer[0].len = BIO_read(socket->wbio, buffer[0].base, len);
 
-			uv_write(&write, (uv_stream_t *) &socket->handle, buffer, 1, socket_write);
-
-			ZVAL_UNDEF(&retval);
-			async_task_suspend(&socket->writes, &retval, execute_data, NULL);
-			zval_ptr_dtor(&retval);
+			write_to_socket(socket, buffer, execute_data);
 
 			efree(buffer[0].base);
 		}
