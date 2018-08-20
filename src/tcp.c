@@ -40,6 +40,60 @@ static async_tcp_socket_reader *async_tcp_socket_reader_object_create(async_tcp_
 static async_tcp_socket_writer *async_tcp_socket_writer_object_create(async_tcp_socket *socket);
 
 
+#ifdef HAVE_ASYNC_SSL
+
+static int ssl_error_continue(async_tcp_socket *socket, int code)
+{
+	int error = SSL_get_error(socket->ssl, code);
+
+	switch (error) {
+	case SSL_ERROR_NONE:
+	case SSL_ERROR_WANT_READ:
+	case SSL_ERROR_WANT_WRITE:
+		return 1;
+	}
+
+	return 0;
+}
+
+static int ssl_feed_data(async_tcp_socket *socket)
+{
+	char *base;
+
+	int len;
+	int error;
+
+	socket->buffer.current = socket->buffer.base;
+	socket->buffer.len = 0;
+
+	base = socket->buffer.base;
+
+	while (SSL_is_init_finished(socket->ssl)) {
+		len = SSL_read(socket->ssl, base, socket->buffer.size - socket->buffer.len);
+		error = SSL_get_error(socket->ssl, len);
+
+		switch (error) {
+		case SSL_ERROR_NONE:
+			break;
+		case SSL_ERROR_WANT_READ:
+			return 0;
+		case SSL_ERROR_ZERO_RETURN:
+			SSL_shutdown(socket->ssl);
+			return 0;
+		default:
+			return error;
+		}
+
+		socket->buffer.len += len;
+		base += len;
+	}
+
+	return 0;
+}
+
+#endif
+
+
 static void socket_disposed(uv_handle_t *handle)
 {
 	async_tcp_socket *socket;
@@ -115,10 +169,22 @@ static void socket_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buff
 		return;
 	}
 
-	uv_read_stop(stream);
-
 	if (nread > 0) {
 		socket->buffer.len = (size_t) nread;
+
+#ifdef HAVE_ASYNC_SSL
+		if (socket->ssl != NULL) {
+			BIO_write(socket->rbio, socket->buffer.current, socket->buffer.len);
+
+			ssl_feed_data(socket);
+
+			if (SSL_is_init_finished(socket->ssl) && socket->buffer.len == 0) {
+				return;
+			}
+		}
+#endif
+
+		uv_read_stop(stream);
 
 		ZVAL_NULL(&data);
 
@@ -126,6 +192,8 @@ static void socket_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buff
 
 		return;
 	}
+
+	uv_read_stop(stream);
 
 	socket->buffer.len = 0;
 
@@ -561,30 +629,6 @@ static inline void socket_call_read(async_tcp_socket *socket, zval *return_value
 
 		async_task_suspend(&socket->reads, return_value, execute_data, &cancelled);
 
-#ifdef HAVE_ASYNC_SSL
-		if (socket->ssl != NULL) {
-			size_t x;
-
-			BIO_write(socket->rbio, socket->buffer.current, socket->buffer.len);
-
-			socket->buffer.current = socket->buffer.base;
-			socket->buffer.len = 0;
-
-			while (1) {
-				x = SSL_read(socket->ssl, socket->buffer.current, socket->buffer.size - socket->buffer.len);
-
-				if (x < 1) {
-					break;
-				}
-
-				socket->buffer.len += x;
-				socket->buffer.current += x;
-
-				php_printf("DECODED: %d\n", (int)x);
-			}
-		}
-#endif
-
 		if (cancelled) {
 			uv_read_stop((uv_stream_t *) &socket->handle);
 			return;
@@ -764,35 +808,45 @@ ZEND_METHOD(Socket, encrypt)
 	uv_buf_t buffer[1];
 
 	size_t len;
+	int options;
 	int code;
+	long result;
 
 	ZEND_PARSE_PARAMETERS_NONE();
 
 	socket = (async_tcp_socket *) Z_OBJ_P(getThis());
 
+	options = SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION;
+	options |= SSL_OP_NO_TICKET;
+	options &= ~SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS;
+
 	socket->ctx = SSL_CTX_new(SSLv23_client_method());
 
-	SSL_CTX_set_options(socket->ctx, SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+	SSL_CTX_set_options(socket->ctx, options);
+	SSL_CTX_set_verify(socket->ctx, SSL_VERIFY_NONE, NULL);
+	SSL_CTX_set_cipher_list(socket->ctx, "HIGH:!SSLv2:!aNULL:!eNULL:!EXPORT:!DES:!MD5:!RC4:!ADH");
 
 	socket->ssl = SSL_new(socket->ctx);
 
 	socket->rbio = BIO_new(BIO_s_mem());
 	socket->wbio = BIO_new(BIO_s_mem());
 
+	BIO_set_mem_eof_return(socket->rbio, -1);
+	BIO_set_mem_eof_return(socket->wbio, -1);
+
 	SSL_set_bio(socket->ssl, socket->rbio, socket->wbio);
 	SSL_set_connect_state(socket->ssl);
+	SSL_set_read_ahead(socket->ssl, 1);
+
+#ifdef SSL_MODE_RELEASE_BUFFERS
+	SSL_set_mode(socket->ssl, SSL_get_mode(socket->ssl) | SSL_MODE_RELEASE_BUFFERS);
+#endif
 
 	code = SSL_do_handshake(socket->ssl);
 
-	if (code != 1) {
-		code = SSL_get_error(socket->ssl, code);
-
-		if (code == 0) {
-			zend_throw_error(NULL, "SSL handshake failed: %d", code);
-			return;
-		}
-
-		php_printf("ERROR: %d / %s\n", code, ERR_reason_error_string(code));
+	if (!ssl_error_continue(socket, code)) {
+		zend_throw_error(NULL, "SSL handshake failed [%d]: %s", code, ERR_reason_error_string(code));
+		return;
 	}
 
 	zval retval;
@@ -817,14 +871,37 @@ ZEND_METHOD(Socket, encrypt)
 		async_task_suspend(&socket->reads, &retval, execute_data, NULL);
 		zval_ptr_dtor(&retval);
 
-		BIO_write(socket->rbio, socket->buffer.current, socket->buffer.len);
+		code = SSL_do_handshake(socket->ssl);
 
-		socket->buffer.current = socket->buffer.base;
-		socket->buffer.len = 0;
-
-		SSL_do_handshake(socket->ssl);
+		if (!ssl_error_continue(socket, code)) {
+			zend_throw_error(NULL, "SSL handshake failed [%d]: %s", code, ERR_reason_error_string(code));
+			return;
+		}
 	}
 
+	X509 *cert = SSL_get_peer_certificate(socket->ssl);
+
+	if (cert == NULL) {
+		X509_free(cert);
+		zend_throw_error(NULL, "Failed to access server SSL certificate");
+		return;
+	}
+
+	X509_free(cert);
+
+	result = SSL_get_verify_result(socket->ssl);
+
+	if (X509_V_OK != result) {
+//		zend_throw_error(NULL, "Failed to verify server SSL certificate [%ld]: %s", result, X509_verify_cert_error_string(result));
+//		return;
+	}
+
+	code = ssl_feed_data(socket);
+
+	if (code != 0) {
+		zend_throw_error(NULL, "SSL data feed failed [%d]: %s", code, ERR_reason_error_string(code));
+		return;
+	}
 #endif
 }
 

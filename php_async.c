@@ -107,11 +107,18 @@ PHP_MINIT_FUNCTION(async)
 	}
 
 #ifdef HAVE_ASYNC_SSL
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined (LIBRESSL_VERSION_NUMBER)
+	OPENSSL_config(NULL);
 	SSL_library_init();
+	OpenSSL_add_all_ciphers();
+	OpenSSL_add_all_digests();
 	OpenSSL_add_all_algorithms();
 	SSL_load_error_strings();
 	ERR_load_BIO_strings();
 	ERR_load_crypto_strings();
+#else
+	OPENSSL_init_ssl(OPENSSL_INIT_LOAD_CONFIG, NULL);
+#endif
 #endif
 
 	async_awaitable_ce_register();
