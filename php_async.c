@@ -106,6 +106,14 @@ PHP_MINIT_FUNCTION(async)
 		async_cli = 0;
 	}
 
+#ifdef HAVE_ASYNC_SSL
+	SSL_library_init();
+	OpenSSL_add_all_algorithms();
+	SSL_load_error_strings();
+	ERR_load_BIO_strings();
+	ERR_load_crypto_strings();
+#endif
+
 	async_awaitable_ce_register();
 	async_context_ce_register();
 	async_deferred_ce_register();

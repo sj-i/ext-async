@@ -30,6 +30,13 @@
 #include <Iphlpapi.h>
 #endif
 
+#ifdef HAVE_ASYNC_SSL
+#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+#endif
+
 #include "uv.h"
 #include "php.h"
 
@@ -672,6 +679,13 @@ struct _async_tcp_socket {
 
 	/* Queue of pending write tasks. */
 	async_awaitable_queue writes;
+
+#ifdef HAVE_ASYNC_SSL
+	SSL_CTX *ctx;
+	SSL *ssl;
+	BIO *rbio;
+	BIO *wbio;
+#endif
 };
 
 struct _async_tcp_socket_reader {

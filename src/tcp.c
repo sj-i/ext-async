@@ -250,6 +250,16 @@ static void async_tcp_socket_object_destroy(zend_object *object)
 		efree(socket->buffer.base);
 	}
 
+#ifdef HAVE_ASYNC_SSL
+	if (socket->ssl != NULL) {
+		SSL_free(socket->ssl);
+	}
+
+	if (socket->ctx != NULL) {
+		SSL_CTX_free(socket->ctx);
+	}
+#endif
+
 	zval_ptr_dtor(&socket->read_error);
 	zval_ptr_dtor(&socket->write_error);
 
@@ -551,6 +561,30 @@ static inline void socket_call_read(async_tcp_socket *socket, zval *return_value
 
 		async_task_suspend(&socket->reads, return_value, execute_data, &cancelled);
 
+#ifdef HAVE_ASYNC_SSL
+		if (socket->ssl != NULL) {
+			size_t x;
+
+			BIO_write(socket->rbio, socket->buffer.current, socket->buffer.len);
+
+			socket->buffer.current = socket->buffer.base;
+			socket->buffer.len = 0;
+
+			while (1) {
+				x = SSL_read(socket->ssl, socket->buffer.current, socket->buffer.size - socket->buffer.len);
+
+				if (x < 1) {
+					break;
+				}
+
+				socket->buffer.len += x;
+				socket->buffer.current += x;
+
+				php_printf("DECODED: %d\n", (int)x);
+			}
+		}
+#endif
+
 		if (cancelled) {
 			uv_read_stop((uv_stream_t *) &socket->handle);
 			return;
@@ -617,6 +651,49 @@ static inline void socket_call_write(async_tcp_socket *socket, zval *return_valu
 		return;
 	}
 
+#ifdef HAVE_ASYNC_SSL
+	if (socket->ssl != NULL) {
+		size_t len;
+		size_t remaining;
+		size_t w;
+
+		char *tmp;
+
+		remaining = ZSTR_LEN(data);
+		tmp = ZSTR_VAL(data);
+
+		while (remaining > 0) {
+			w = SSL_write(socket->ssl, tmp, remaining);
+
+			tmp += w;
+			remaining -= w;
+
+			len = BIO_ctrl_pending(socket->wbio);
+
+			while ((len = BIO_ctrl_pending(socket->wbio)) > 0) {
+				buffer[0].base = emalloc(len);
+				buffer[0].len = len;
+
+				BIO_read(socket->wbio, buffer[0].base, len);
+
+				result = uv_write(&write, (uv_stream_t *) &socket->handle, buffer, 1, socket_write);
+
+				if (UNEXPECTED(result != 0)) {
+					efree(buffer[0].base);
+					zend_throw_exception_ex(async_stream_exception_ce, 0, "Failed to queue socket write: %s", uv_strerror(result));
+					return;
+				}
+
+				async_task_suspend(&socket->writes, return_value, execute_data, NULL);
+
+				efree(buffer[0].base);
+			}
+		}
+
+		return;
+	}
+#endif
+
 	buffer[0].base = ZSTR_VAL(data);
 	buffer[0].len = ZSTR_LEN(data);
 
@@ -676,6 +753,81 @@ ZEND_METHOD(Socket, writeStream)
 	RETURN_ZVAL(&obj, 1, 1);
 }
 
+ZEND_METHOD(Socket, encrypt)
+{
+#ifndef HAVE_ASYNC_SSL
+	zend_throw_error(NULL, "Async extension was not compiled with SSL support");
+#else
+	async_tcp_socket *socket;
+
+	uv_write_t write;
+	uv_buf_t buffer[1];
+
+	size_t len;
+	int code;
+
+	ZEND_PARSE_PARAMETERS_NONE();
+
+	socket = (async_tcp_socket *) Z_OBJ_P(getThis());
+
+	socket->ctx = SSL_CTX_new(SSLv23_client_method());
+
+	SSL_CTX_set_options(socket->ctx, SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+
+	socket->ssl = SSL_new(socket->ctx);
+
+	socket->rbio = BIO_new(BIO_s_mem());
+	socket->wbio = BIO_new(BIO_s_mem());
+
+	SSL_set_bio(socket->ssl, socket->rbio, socket->wbio);
+	SSL_set_connect_state(socket->ssl);
+
+	code = SSL_do_handshake(socket->ssl);
+
+	if (code != 1) {
+		code = SSL_get_error(socket->ssl, code);
+
+		if (code == 0) {
+			zend_throw_error(NULL, "SSL handshake failed: %d", code);
+			return;
+		}
+
+		php_printf("ERROR: %d / %s\n", code, ERR_reason_error_string(code));
+	}
+
+	zval retval;
+
+	while (!SSL_is_init_finished(socket->ssl)) {
+		while ((len = BIO_ctrl_pending(socket->wbio)) > 0) {
+			buffer[0].base = emalloc(len);
+			buffer[0].len = BIO_read(socket->wbio, buffer[0].base, len);
+
+			uv_write(&write, (uv_stream_t *) &socket->handle, buffer, 1, socket_write);
+
+			ZVAL_UNDEF(&retval);
+			async_task_suspend(&socket->writes, &retval, execute_data, NULL);
+			zval_ptr_dtor(&retval);
+
+			efree(buffer[0].base);
+		}
+
+		uv_read_start((uv_stream_t *) &socket->handle, socket_read_alloc, socket_read);
+
+		ZVAL_UNDEF(&retval);
+		async_task_suspend(&socket->reads, &retval, execute_data, NULL);
+		zval_ptr_dtor(&retval);
+
+		BIO_write(socket->rbio, socket->buffer.current, socket->buffer.len);
+
+		socket->buffer.current = socket->buffer.base;
+		socket->buffer.len = 0;
+
+		SSL_do_handshake(socket->ssl);
+	}
+
+#endif
+}
+
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_tcp_socket_connect, 0, 2, Concurrent\\Network\\TcpSocket, 0)
 	ZEND_ARG_TYPE_INFO(0, host, IS_STRING, 0)
 	ZEND_ARG_TYPE_INFO(0, port, IS_LONG, 0)
@@ -712,6 +864,8 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_OBJ_INFO_EX(arginfo_tcp_socket_write_stream, 0, 0, Concurrent\\Stream\\WritableStream, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_tcp_socket_encrypt, 0, 0, IS_VOID, 0)
+ZEND_END_ARG_INFO()
 
 static const zend_function_entry async_tcp_socket_functions[] = {
 	ZEND_ME(Socket, connect, arginfo_tcp_socket_connect, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
@@ -724,6 +878,7 @@ static const zend_function_entry async_tcp_socket_functions[] = {
 	ZEND_ME(Socket, readStream, arginfo_tcp_socket_read_stream, ZEND_ACC_PUBLIC)
 	ZEND_ME(Socket, write, arginfo_tcp_socket_write, ZEND_ACC_PUBLIC)
 	ZEND_ME(Socket, writeStream, arginfo_tcp_socket_write_stream, ZEND_ACC_PUBLIC)
+	ZEND_ME(Socket, encrypt, arginfo_tcp_socket_encrypt, ZEND_ACC_PUBLIC)
 	ZEND_FE_END
 };
 
