@@ -12,6 +12,8 @@ if (($_SERVER['argv'][1] ?? null)) {
 $server = TcpServer::listen('localhost', 8080, $encryption);
 
 try {
+    var_dump($server->getHost(), $server->getPort(), $server->getPeer());
+    
     for ($i = 0; $i < 3; $i++) {
         $socket = $server->accept();
         

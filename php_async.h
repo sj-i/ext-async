@@ -649,9 +649,14 @@ struct _async_task_scheduler {
 };
 
 struct _async_tcp_client_encryption {
+	/* PHP object handle. */
 	zend_object std;
 
+	/* If set self-signed server certificates are accepted. */
 	zend_bool allow_self_signed;
+
+	/* Name of the peer to connect to. */
+	zend_string *peer_name;
 };
 
 struct _async_tcp_server {
@@ -661,6 +666,13 @@ struct _async_tcp_server {
 	/* UV TCP handle. */
 	uv_tcp_t handle;
 
+	/* Hostname or IP address that was used to establish the connection. */
+	zend_string *name;
+
+	/* Port number being used to bind the server socket. */
+	uint16_t port;
+
+	/* Number of pending connection attempts queued in the backlog. */
 	zend_uchar pending;
 
 	/* Error being used to close the server. */
@@ -670,16 +682,25 @@ struct _async_tcp_server {
 	async_awaitable_queue accepts;
 
 #ifdef HAVE_ASYNC_SSL
+	/* TLS server encryption settings. */
 	async_tcp_server_encryption *encryption;
+
+	/* Server SSL context (shared between all socket connections). */
 	SSL_CTX *ctx;
 #endif
 };
 
 struct _async_tcp_server_encryption {
+	/* PHP object handle. */
 	zend_object std;
 
+	/* Location of the file holding the default X509 certificate. */
 	zend_string *cert;
+
+	/* Location of the file holding the private key of the default X509 certificate. */
 	zend_string *key;
+
+	/* Passphrase being used to protect the default private key. */
 	zend_string *passphrase;
 };
 
@@ -690,9 +711,10 @@ struct _async_tcp_socket {
 	/* UV TCP handle. */
 	uv_tcp_t handle;
 
-	char *name;
-	zend_long port;
+	/* Hostname or IP address that was used to establish the connection. */
+	zend_string *name;
 
+	/* Refers to the (local) server that accepted the TCP socket connection. */
 	async_tcp_server *server;
 
 	/* Is set if EOF has been red. */
@@ -714,12 +736,19 @@ struct _async_tcp_socket {
 	async_awaitable_queue writes;
 
 #ifdef HAVE_ASYNC_SSL
+	/* TLS client encryption settings. */
 	async_tcp_client_encryption *encryption;
 
+	/* SSL context being used by the connection. */
 	SSL_CTX *ctx;
+
+	/* SSL instance being used to encrypt / decrypt data. */
 	SSL *ssl;
 
+	/* Holds encrypted bytes that have been read from the socket. */
 	BIO *rbio;
+
+	/* Holds encrypted bytes that need to be written to the socket. */
 	BIO *wbio;
 #endif
 };

@@ -331,6 +331,12 @@ final class TcpServer
     
     public function close(?\Throwable $e = null): void { }
     
+    public function getHost(): string { }
+    
+    public function getPort(): int { }
+    
+    public function getPeer(): array { }
+    
     public function accept(): Socket { }
 }
 ```
@@ -345,6 +351,8 @@ namespace Concurrent\Network;
 final class ClientEncryption
 {
     public function withAllowSelfSigned(bool $allow): self { }
+    
+    public function withPeerName(string $name): self { }
 }
 ```
 
