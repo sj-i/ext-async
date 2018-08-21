@@ -294,7 +294,7 @@ use Concurrent\Stream\WritableStream
 
 final class TcpSocket implements DuplexStream
 {
-    public static function connect(string $host, int $port): Socket { }
+    public static function connect(string $host, int $port, ?ClientEncryption $encryption = null): Socket { }
     
     public static function pair(): array { }
     
@@ -305,6 +305,8 @@ final class TcpSocket implements DuplexStream
     public function getLocalPeer(): array { }
     
     public function getRemotePeer(): array { }
+    
+    public function encrypt(): void { }
     
     public function read(?int $length = null): ?string { }
     
@@ -325,11 +327,37 @@ namespace Concurrent\Network;
 
 final class TcpServer
 {
-    public static function listen(string $host, int $port): Server { }
+    public static function listen(string $host, int $port, ?ServerEncryption $encryption = null): Server { }
     
     public function close(?\Throwable $e = null): void { }
     
     public function accept(): Socket { }
+}
+```
+
+### ClientEncryption
+
+Configures an encrypted (TLS) socket client.
+
+```php
+namespace Concurrent\Network;
+
+final class ClientEncryption
+{
+    public function withAllowSelfSigned(bool $allow): self { }
+}
+```
+
+### ServerEncryption
+
+Configures an encrypted (TLS) socket server.
+
+```php
+namespace Concurrent\Network;
+
+final class ServerEncryption
+{
+    public function withDefaultCertificate(string $cert, string $key, ?string $passphrase = null): self { }
 }
 ```
 
