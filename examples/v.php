@@ -16,6 +16,7 @@ try {
                 if ($encrypted) {
                     var_dump('Negotiate TLS');
                     $socket->encrypt(true);
+                    var_dump('TLS established');
                 }
                 
                 $buffer = '';

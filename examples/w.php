@@ -9,6 +9,7 @@ try {
     if ($encrypted) {
         var_dump('Negotiate TLS');
         $socket->encrypt();
+        var_dump('TLS established');
     }
     
     $socket->write('Hello World :)');

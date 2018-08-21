@@ -59,6 +59,23 @@ static int ssl_error_continue(async_tcp_socket *socket, int code)
 	return 0;
 }
 
+static void ssl_send_handshake_bytes(async_tcp_socket *socket, zend_execute_data *execute_data)
+{
+	uv_buf_t buffer[1];
+	size_t len;
+
+	while ((len = BIO_ctrl_pending(socket->wbio)) > 0) {
+		buffer[0].base = emalloc(len);
+		buffer[0].len = BIO_read(socket->wbio, buffer[0].base, len);
+
+		write_to_socket(socket, buffer, execute_data);
+
+		efree(buffer[0].base);
+
+		ASYNC_RETURN_ON_ERROR();
+	}
+}
+
 static int ssl_feed_data(async_tcp_socket *socket)
 {
 	char *base;
@@ -145,30 +162,42 @@ static int ssl_verify_callback(int preverify, X509_STORE_CTX *ctx)
 	ssl = X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
 	socket = (async_tcp_socket *) SSL_get_ex_data(ssl, async_index);
 
+	// Allow self-signed cert only as first cert in chain.
+	if (depth == 0 && err == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT) {
+		err = 0;
+		preverify = 1;
+		X509_STORE_CTX_set_error(ctx, X509_V_OK);
+	}
+
 	if (!cert || err || socket == NULL) {
 		return preverify;
 	}
 
 	if (depth == 0) {
 		if ((i = X509_NAME_get_index_by_NID(X509_get_subject_name((X509 *) cert), NID_commonName, -1)) < 0) {
+			X509_STORE_CTX_set_error(ctx, X509_V_ERR_APPLICATION_VERIFICATION);
 			return 0;
 		}
 
 		if (NULL == (entry = X509_NAME_get_entry(X509_get_subject_name((X509 *) cert), i))) {
+			X509_STORE_CTX_set_error(ctx, X509_V_ERR_APPLICATION_VERIFICATION);
 			return 0;
 		}
 
 		if (NULL == (str = X509_NAME_ENTRY_get_data(entry))) {
+			X509_STORE_CTX_set_error(ctx, X509_V_ERR_APPLICATION_VERIFICATION);
 			return 0;
 		}
 
 		cn = (char *) ASN1_STRING_data(str);
 
 		if ((size_t) ASN1_STRING_length(str) != strlen(cn)) {
+			X509_STORE_CTX_set_error(ctx, X509_V_ERR_APPLICATION_VERIFICATION);
 			return 0;
 		}
 
 		if (!ssl_match_hostname(socket->name, cn)) {
+			X509_STORE_CTX_set_error(ctx, X509_V_ERR_APPLICATION_VERIFICATION);
 			return 0;
 		}
 	}
@@ -182,7 +211,7 @@ static int ssl_passphrase_cb(char *buf, int size, int rwflag, void *obj)
 //
 //	socket = (async_tcp_socket *) obj;
 
-	memcpy(buf, "localhost", sizeof("localhost"));
+	strcpy(buf, "localhost");
 
 	return sizeof("localhost")-1;
 }
@@ -491,9 +520,7 @@ ZEND_METHOD(Socket, connect)
 
 	async_gethostbyname(name, &ip, execute_data);
 
-	if (UNEXPECTED(EG(exception))) {
-		return;
-	}
+	ASYNC_RETURN_ON_ERROR();
 
 	socket = async_tcp_socket_object_create();
 	socket->name = name;
@@ -857,9 +884,7 @@ static inline void socket_call_write(async_tcp_socket *socket, zval *return_valu
 
 				efree(buffer[0].base);
 
-				if (UNEXPECTED(EG(exception))) {
-					return;
-				}
+				ASYNC_RETURN_ON_ERROR();
 			}
 		}
 
@@ -906,11 +931,8 @@ ZEND_METHOD(Socket, encrypt)
 	zend_bool server;
 
 	X509 *cert;
-
-	uv_buf_t buffer[1];
 	char *cadir;
 
-	size_t len;
 	int options;
 	int code;
 	long result;
@@ -933,6 +955,9 @@ ZEND_METHOD(Socket, encrypt)
 	SSL_CTX_set_options(socket->ctx, options);
 	SSL_CTX_set_cipher_list(socket->ctx, "HIGH:!SSLv2:!aNULL:!eNULL:!EXPORT:!DES:!MD5:!RC4:!ADH");
 
+	SSL_CTX_set_default_passwd_cb_userdata(socket->ctx, socket);
+	SSL_CTX_set_default_passwd_cb(socket->ctx, ssl_passphrase_cb);
+
 	if (server) {
 		SSL_CTX_set_verify(socket->ctx, SSL_VERIFY_NONE, NULL);
 		SSL_CTX_use_certificate_file(socket->ctx, "/vagrant/examples/cert/localhost.crt", SSL_FILETYPE_PEM);
@@ -941,9 +966,6 @@ ZEND_METHOD(Socket, encrypt)
 		SSL_CTX_set_verify(socket->ctx, SSL_VERIFY_PEER, ssl_verify_callback);
 		SSL_CTX_set_verify_depth(socket->ctx, 10);
 	}
-
-	SSL_CTX_set_default_passwd_cb_userdata(socket->ctx, socket);
-	SSL_CTX_set_default_passwd_cb(socket->ctx, ssl_passphrase_cb);
 
 	// Use default X509 cert directory.
 	cadir = getenv(X509_get_default_cert_dir_env());
@@ -982,18 +1004,9 @@ ZEND_METHOD(Socket, encrypt)
 	zval retval;
 
 	while (!SSL_is_init_finished(socket->ssl)) {
-		while ((len = BIO_ctrl_pending(socket->wbio)) > 0) {
-			buffer[0].base = emalloc(len);
-			buffer[0].len = BIO_read(socket->wbio, buffer[0].base, len);
+		ssl_send_handshake_bytes(socket, execute_data);
 
-			write_to_socket(socket, buffer, execute_data);
-
-			efree(buffer[0].base);
-
-			if (UNEXPECTED(EG(exception))) {
-				return;
-			}
-		}
+		ASYNC_RETURN_ON_ERROR();
 
 		uv_read_start((uv_stream_t *) &socket->handle, socket_read_alloc, socket_read);
 
@@ -1001,9 +1014,7 @@ ZEND_METHOD(Socket, encrypt)
 		async_task_suspend(&socket->reads, &retval, execute_data, NULL);
 		zval_ptr_dtor(&retval);
 
-		if (UNEXPECTED(EG(exception))) {
-			return;
-		}
+		ASYNC_RETURN_ON_ERROR();
 
 		if (socket->eof) {
 			zend_throw_error(NULL, "SSL handshake failed due to closed socket");
@@ -1017,6 +1028,10 @@ ZEND_METHOD(Socket, encrypt)
 			return;
 		}
 	}
+
+	ssl_send_handshake_bytes(socket, execute_data);
+
+	ASYNC_RETURN_ON_ERROR();
 
 	if (!server) {
 		cert = SSL_get_peer_certificate(socket->ssl);
@@ -1344,9 +1359,7 @@ ZEND_METHOD(Server, listen)
 
 	code = uv_ip4_addr(Z_STRVAL_P(&ip), (int) port, &bind);
 
-	if (UNEXPECTED(EG(exception))) {
-		return;
-	}
+	ASYNC_RETURN_ON_ERROR();
 
 	zval_ptr_dtor(&ip);
 

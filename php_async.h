@@ -846,6 +846,12 @@ ZEND_TSRMLS_CACHE_EXTERN()
 
 #endif
 
+#define ASYNC_RETURN_ON_ERROR() do { \
+	if (UNEXPECTED(EG(exception))) { \
+		return; \
+	} \
+} while (0)
+
 /*
  * Queue macros require a "q" pointer with fields "first" and "last" of same ponter type as "v".
  * The "v" pointer must have fields "prev" and "next" of the same pointer type as "v".
