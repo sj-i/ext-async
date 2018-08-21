@@ -2,17 +2,17 @@
 
 namespace Concurrent\Network;
 
-$encrypted = ($_SERVER['argv'][1] ?? null) ? true : false;
+$encryption = ($_SERVER['argv'][1] ?? null) ? new ClientEncryption() : null;
 
-$socket = TcpSocket::connect('google.com', $encrypted ? 443 : 80);
-// $socket = TcpSocket::connect('httpbin.org', $encrypted ? 443 : 80);
+$socket = TcpSocket::connect('google.com', $encryption ? 443 : 80, $encryption);
+// $socket = TcpSocket::connect('httpbin.org', $encryption ? 443 : 80, $encryption);
 
 try {
     var_dump($socket->getLocalPeer(), $socket->getRemotePeer());
     
     $socket->nodelay(true);
     
-    if ($encrypted) {
+    if ($encryption) {
         $socket->encrypt();
     }
     

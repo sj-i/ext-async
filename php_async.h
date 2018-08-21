@@ -111,7 +111,9 @@ ASYNC_API extern zend_class_entry *async_signal_watcher_ce;
 ASYNC_API extern zend_class_entry *async_stream_watcher_ce;
 ASYNC_API extern zend_class_entry *async_task_ce;
 ASYNC_API extern zend_class_entry *async_task_scheduler_ce;
+ASYNC_API extern zend_class_entry *async_tcp_client_encryption_ce;
 ASYNC_API extern zend_class_entry *async_tcp_server_ce;
+ASYNC_API extern zend_class_entry *async_tcp_server_encryption_ce;
 ASYNC_API extern zend_class_entry *async_tcp_socket_ce;
 ASYNC_API extern zend_class_entry *async_timer_ce;
 ASYNC_API extern zend_class_entry *async_writable_pipe_ce;
@@ -166,7 +168,9 @@ typedef struct _async_task                          async_task;
 typedef struct _async_task_suspended                async_task_suspended;
 typedef struct _async_task_scheduler                async_task_scheduler;
 typedef struct _async_task_queue                    async_task_queue;
+typedef struct _async_tcp_client_encryption         async_tcp_client_encryption;
 typedef struct _async_tcp_server                    async_tcp_server;
+typedef struct _async_tcp_server_encryption         async_tcp_server_encryption;
 typedef struct _async_tcp_socket                    async_tcp_socket;
 typedef struct _async_tcp_socket_reader             async_tcp_socket_reader;
 typedef struct _async_tcp_socket_writer             async_tcp_socket_writer;
@@ -644,6 +648,12 @@ struct _async_task_scheduler {
 	async_enable_queue enable;
 };
 
+struct _async_tcp_client_encryption {
+	zend_object std;
+
+	zend_bool allow_self_signed;
+};
+
 struct _async_tcp_server {
 	/* PHP object handle. */
 	zend_object std;
@@ -658,6 +668,19 @@ struct _async_tcp_server {
 
 	/* Queue of tasks waiting to accept a socket connection. */
 	async_awaitable_queue accepts;
+
+#ifdef HAVE_ASYNC_SSL
+	async_tcp_server_encryption *encryption;
+	SSL_CTX *ctx;
+#endif
+};
+
+struct _async_tcp_server_encryption {
+	zend_object std;
+
+	zend_string *cert;
+	zend_string *key;
+	zend_string *passphrase;
 };
 
 struct _async_tcp_socket {
@@ -669,6 +692,8 @@ struct _async_tcp_socket {
 
 	char *name;
 	zend_long port;
+
+	async_tcp_server *server;
 
 	/* Is set if EOF has been red. */
 	zend_bool eof;
@@ -689,8 +714,11 @@ struct _async_tcp_socket {
 	async_awaitable_queue writes;
 
 #ifdef HAVE_ASYNC_SSL
+	async_tcp_client_encryption *encryption;
+
 	SSL_CTX *ctx;
 	SSL *ssl;
+
 	BIO *rbio;
 	BIO *wbio;
 #endif
