@@ -70,6 +70,21 @@ static int ssl_error_continue(async_tcp_socket *socket, int code)
 	return 0;
 }
 
+static int ssl_cert_passphrase_cb(char *buf, int size, int rwflag, void *obj)
+{
+	async_tcp_cert *cert;
+
+	cert = (async_tcp_cert *) obj;
+
+	if (cert == NULL || cert->passphrase == NULL) {
+		return 0;
+	}
+
+	strcpy(buf, ZSTR_VAL(cert->passphrase));
+
+	return ZSTR_LEN(cert->passphrase);
+}
+
 static SSL_CTX *ssl_create_context()
 {
 	SSL_CTX *ctx;
@@ -244,24 +259,41 @@ static int ssl_verify_callback(int preverify, X509_STORE_CTX *ctx)
 	return preverify;
 }
 
-static int ssl_client_passphrase_cb(char *buf, int size, int rwflag, void *obj)
-{
-	return 0;
-}
-
-static int ssl_server_passphrase_cb(char *buf, int size, int rwflag, void *obj)
+static int ssl_servername_cb(SSL *ssl, int *ad, void *arg)
 {
 	async_tcp_server *server;
+	async_tcp_cert *cert;
+	zend_string *key;
 
-	server = (async_tcp_server *) obj;
+	const char *name;
 
-	if (server->encryption->passphrase == NULL) {
-		return 0;
+	if (ssl == NULL) {
+		return SSL_TLSEXT_ERR_NOACK;
 	}
 
-	strcpy(buf, ZSTR_VAL(server->encryption->passphrase));
+	name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
 
-	return ZSTR_LEN(server->encryption->passphrase);
+	if (name == NULL || name[0] == '\0') {
+		return SSL_TLSEXT_ERR_NOACK;
+	}
+
+	server = (async_tcp_server *) arg;
+	key = zend_string_init(name, strlen(name), 0);
+
+	cert = server->encryption->certs.first;
+
+	while (cert != NULL) {
+		if (zend_string_equals(key, cert->host)) {
+			SSL_set_SSL_CTX(ssl, cert->ctx);
+			break;
+		}
+
+		cert = cert->next;
+	}
+
+	zend_string_release(key);
+
+	return SSL_TLSEXT_ERR_OK;
 }
 
 #endif
@@ -1077,8 +1109,8 @@ ZEND_METHOD(Socket, encrypt)
 	if (socket->server == NULL) {
 		socket->ctx = ssl_create_context();
 
-		SSL_CTX_set_default_passwd_cb_userdata(socket->ctx, socket);
-		SSL_CTX_set_default_passwd_cb(socket->ctx, ssl_client_passphrase_cb);
+		SSL_CTX_set_default_passwd_cb_userdata(socket->ctx, NULL);
+		SSL_CTX_set_default_passwd_cb(socket->ctx, ssl_cert_passphrase_cb);
 
 		SSL_CTX_set_verify(socket->ctx, SSL_VERIFY_PEER, ssl_verify_callback);
 		SSL_CTX_set_verify_depth(socket->ctx, 10);
@@ -1105,7 +1137,16 @@ ZEND_METHOD(Socket, encrypt)
 	if (socket->server != NULL) {
 		SSL_set_accept_state(socket->ssl);
 	} else {
+		char name[256];
+
+		if (socket->encryption != NULL && socket->encryption->peer_name != NULL) {
+			strcpy(name, ZSTR_VAL(socket->encryption->peer_name));
+		} else {
+			strcpy(name, ZSTR_VAL(socket->name));
+		}
+
 		SSL_set_connect_state(socket->ssl);
+		SSL_set_tlsext_host_name(socket->ssl, name);
 	}
 
 	SSL_set_mode(socket->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
@@ -1538,12 +1579,14 @@ ZEND_METHOD(Server, listen)
 
 		server->ctx = ssl_create_context();
 
-		SSL_CTX_set_default_passwd_cb_userdata(server->ctx, server);
-		SSL_CTX_set_default_passwd_cb(server->ctx, ssl_server_passphrase_cb);
+		SSL_CTX_set_default_passwd_cb(server->ctx, ssl_cert_passphrase_cb);
+		SSL_CTX_set_default_passwd_cb_userdata(server->ctx, &server->encryption->cert);
 
-		SSL_CTX_set_verify(server->ctx, SSL_VERIFY_NONE, NULL);
-		SSL_CTX_use_certificate_file(server->ctx, ZSTR_VAL(server->encryption->cert), SSL_FILETYPE_PEM);
-		SSL_CTX_use_PrivateKey_file(server->ctx, ZSTR_VAL(server->encryption->key), SSL_FILETYPE_PEM);
+		SSL_CTX_use_certificate_file(server->ctx, ZSTR_VAL(server->encryption->cert.file), SSL_FILETYPE_PEM);
+		SSL_CTX_use_PrivateKey_file(server->ctx, ZSTR_VAL(server->encryption->cert.key), SSL_FILETYPE_PEM);
+
+		SSL_CTX_set_tlsext_servername_callback(server->ctx, ssl_servername_cb);
+		SSL_CTX_set_tlsext_servername_arg(server->ctx, server);
 #else
 		zend_throw_error(NULL, "Serevr encryption requires async extension to be compiled with SSL support");
 		OBJ_RELEASE(&server->std);
@@ -1829,16 +1872,16 @@ static async_tcp_server_encryption *clone_server_encryption(async_tcp_server_enc
 
 	result = (async_tcp_server_encryption *) async_tcp_server_encryption_object_create(async_tcp_server_encryption_ce);
 
-	if (encryption->cert != NULL) {
-		result->cert = zend_string_copy(encryption->cert);
+	if (encryption->cert.file != NULL) {
+		result->cert.file = zend_string_copy(encryption->cert.file);
 	}
 
-	if (encryption->key != NULL) {
-		result->key = zend_string_copy(encryption->key);
+	if (encryption->cert.key != NULL) {
+		result->cert.key = zend_string_copy(encryption->cert.key);
 	}
 
-	if (encryption->passphrase != NULL) {
-		result->passphrase = zend_string_copy(encryption->passphrase);
+	if (encryption->cert.passphrase != NULL) {
+		result->cert.passphrase = zend_string_copy(encryption->cert.passphrase);
 	}
 
 	return result;
@@ -1850,17 +1893,23 @@ static void async_tcp_server_encryption_object_destroy(zend_object *object)
 
 	encryption = (async_tcp_server_encryption *) object;
 
-	if (encryption->cert != NULL) {
-		zend_string_release(encryption->cert);
+	if (encryption->cert.file != NULL) {
+		zend_string_release(encryption->cert.file);
 	}
 
-	if (encryption->key != NULL) {
-		zend_string_release(encryption->key);
+	if (encryption->cert.key != NULL) {
+		zend_string_release(encryption->cert.key);
 	}
 
-	if (encryption->passphrase != NULL) {
-		zend_string_release(encryption->passphrase);
+	if (encryption->cert.passphrase != NULL) {
+		zend_string_release(encryption->cert.passphrase);
 	}
+
+#ifdef HAVE_ASYNC_SSL
+	if (encryption->cert.ctx != NULL) {
+		SSL_CTX_free(encryption->cert.ctx);
+	}
+#endif
 
 	zend_object_std_dtor(&encryption->std);
 }
@@ -1869,7 +1918,7 @@ ZEND_METHOD(ServerEncryption, withDefaultCertificate)
 {
 	async_tcp_server_encryption *encryption;
 
-	zend_string *cert;
+	zend_string *file;
 	zend_string *key;
 	zend_string *passphrase;
 
@@ -1878,7 +1927,7 @@ ZEND_METHOD(ServerEncryption, withDefaultCertificate)
 	passphrase = NULL;
 
 	ZEND_PARSE_PARAMETERS_START_EX(ZEND_PARSE_PARAMS_THROW, 2, 3)
-		Z_PARAM_STR(cert)
+		Z_PARAM_STR(file)
 		Z_PARAM_STR(key)
 		Z_PARAM_OPTIONAL
 		Z_PARAM_STR(passphrase)
@@ -1886,12 +1935,74 @@ ZEND_METHOD(ServerEncryption, withDefaultCertificate)
 
 	encryption = clone_server_encryption((async_tcp_server_encryption *) Z_OBJ_P(getThis()));
 
-	encryption->cert = zend_string_copy(cert);
-	encryption->key = zend_string_copy(key);
+	encryption->cert.file = zend_string_copy(file);
+	encryption->cert.key = zend_string_copy(key);
 
 	if (passphrase != NULL) {
-		encryption->passphrase = zend_string_copy(passphrase);
+		encryption->cert.passphrase = zend_string_copy(passphrase);
 	}
+
+	ZVAL_OBJ(&obj, &encryption->std);
+
+	RETURN_ZVAL(&obj, 1, 1);
+}
+
+ZEND_METHOD(ServerEncryption, withCertificate)
+{
+	async_tcp_server_encryption *encryption;
+	async_tcp_cert *cert;
+	async_tcp_cert *current;
+
+	zend_string *host;
+	zend_string *file;
+	zend_string *key;
+	zend_string *passphrase;
+
+	zval obj;
+
+	ZEND_PARSE_PARAMETERS_START_EX(ZEND_PARSE_PARAMS_THROW, 3, 4)
+		Z_PARAM_STR(host)
+		Z_PARAM_STR(file)
+		Z_PARAM_STR(key)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_STR(passphrase)
+	ZEND_PARSE_PARAMETERS_END();
+
+	encryption = clone_server_encryption((async_tcp_server_encryption *) Z_OBJ_P(getThis()));
+
+	cert = emalloc(sizeof(async_tcp_cert));
+	ZEND_SECURE_ZERO(cert, sizeof(async_tcp_cert));
+
+	cert->host = zend_string_copy(host);
+	cert->file = zend_string_copy(file);
+	cert->key = zend_string_copy(key);
+
+	if (passphrase != NULL) {
+		cert->passphrase = zend_string_copy(passphrase);
+	}
+
+#ifdef HAVE_ASYNC_SSL
+	cert->ctx = ssl_create_context();
+
+	SSL_CTX_set_default_passwd_cb(cert->ctx, ssl_cert_passphrase_cb);
+	SSL_CTX_set_default_passwd_cb_userdata(cert->ctx, cert);
+
+	SSL_CTX_use_certificate_file(cert->ctx, ZSTR_VAL(cert->file), SSL_FILETYPE_PEM);
+	SSL_CTX_use_PrivateKey_file(cert->ctx, ZSTR_VAL(cert->key), SSL_FILETYPE_PEM);
+#endif
+
+	current = encryption->certs.first;
+
+	while (current != NULL) {
+		if (zend_string_equals(current->host, cert->host)) {
+			ASYNC_Q_DETACH(&encryption->certs, current);
+			break;
+		}
+
+		current = current->next;
+	}
+
+	ASYNC_Q_ENQUEUE(&encryption->certs, cert);
 
 	ZVAL_OBJ(&obj, &encryption->std);
 

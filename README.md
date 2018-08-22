@@ -366,6 +366,8 @@ namespace Concurrent\Network;
 final class ServerEncryption
 {
     public function withDefaultCertificate(string $cert, string $key, ?string $passphrase = null): self { }
+    
+    public function withCertificate(string $host, string $cert, string $key, ?string $passphrase = null): self { }
 }
 ```
 

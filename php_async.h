@@ -168,6 +168,8 @@ typedef struct _async_task                          async_task;
 typedef struct _async_task_suspended                async_task_suspended;
 typedef struct _async_task_scheduler                async_task_scheduler;
 typedef struct _async_task_queue                    async_task_queue;
+typedef struct _async_tcp_cert                      async_tcp_cert;
+typedef struct _async_tcp_cert_queue                async_tcp_cert_queue;
 typedef struct _async_tcp_client_encryption         async_tcp_client_encryption;
 typedef struct _async_tcp_server                    async_tcp_server;
 typedef struct _async_tcp_server_encryption         async_tcp_server_encryption;
@@ -648,6 +650,25 @@ struct _async_task_scheduler {
 	async_enable_queue enable;
 };
 
+struct _async_tcp_cert {
+	zend_string *host;
+	zend_string *file;
+	zend_string *key;
+	zend_string *passphrase;
+
+#ifdef HAVE_ASYNC_SSL
+	SSL_CTX *ctx;
+#endif
+
+	async_tcp_cert *next;
+	async_tcp_cert *prev;
+};
+
+struct _async_tcp_cert_queue {
+	async_tcp_cert *first;
+	async_tcp_cert *last;
+};
+
 struct _async_tcp_client_encryption {
 	/* PHP object handle. */
 	zend_object std;
@@ -694,14 +715,8 @@ struct _async_tcp_server_encryption {
 	/* PHP object handle. */
 	zend_object std;
 
-	/* Location of the file holding the default X509 certificate. */
-	zend_string *cert;
-
-	/* Location of the file holding the private key of the default X509 certificate. */
-	zend_string *key;
-
-	/* Passphrase being used to protect the default private key. */
-	zend_string *passphrase;
+	async_tcp_cert cert;
+	async_tcp_cert_queue certs;
 };
 
 struct _async_tcp_socket {
