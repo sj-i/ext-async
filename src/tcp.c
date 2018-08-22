@@ -124,18 +124,14 @@ static int ssl_feed_data(async_tcp_socket *socket)
 
 	while (SSL_is_init_finished(socket->ssl)) {
 		len = SSL_read(socket->ssl, base, socket->buffer.size - socket->buffer.len);
-		error = SSL_get_error(socket->ssl, len);
 
-		switch (error) {
-		case SSL_ERROR_NONE:
-			break;
-		case SSL_ERROR_WANT_READ:
-			return 0;
-		case SSL_ERROR_ZERO_RETURN:
-			SSL_shutdown(socket->ssl);
-			return 0;
-		default:
-			return error;
+		if (len < 1) {
+			switch (error = SSL_get_error(socket->ssl, len)) {
+			case SSL_ERROR_WANT_READ:
+				return 0;
+			default:
+				return error;
+			}
 		}
 
 		socket->buffer.len += len;
@@ -943,21 +939,30 @@ static inline void socket_call_write(async_tcp_socket *socket, zval *return_valu
 
 		size_t len;
 		size_t remaining;
-		size_t w;
 
 		char *tmp;
 		int i;
+		int w;
 		int num;
 
 		remaining = ZSTR_LEN(data);
 		tmp = ZSTR_VAL(data);
 
 		num = 0;
+
+		buffer = NULL;
 		first = NULL;
 		last = NULL;
 
 		while (remaining > 0) {
 			w = SSL_write(socket->ssl, tmp, remaining);
+
+			if (w < 1 && !ssl_error_continue(socket, w)) {
+				num = 0;
+
+				zend_throw_error(NULL, "SSL write operation failed [%d]: %s", w, ERR_reason_error_string(w));
+				break;
+			}
 
 			tmp += w;
 			remaining -= w;
@@ -985,11 +990,6 @@ static inline void socket_call_write(async_tcp_socket *socket, zval *return_valu
 
 		if (num == 1) {
 			write_to_socket(socket, &first->buf, 1, execute_data);
-
-			efree(first->buf.base);
-			efree(first);
-
-			ASYNC_RETURN_ON_ERROR();
 		} else if (num > 1) {
 			buffer = ecalloc(num, sizeof(uv_buf_t));
 
@@ -1003,22 +1003,24 @@ static inline void socket_call_write(async_tcp_socket *socket, zval *return_valu
 			}
 
 			write_to_socket(socket, buffer, num, execute_data);
-
-			current = first;
-
-			while (current != NULL) {
-				efree(current->buf.base);
-
-				last = current;
-				current = current->next;
-
-				efree(last);
-			}
-
-			efree(buffer);
-
-			ASYNC_RETURN_ON_ERROR();
 		}
+
+		current = first;
+
+		while (current != NULL) {
+			efree(current->buf.base);
+
+			last = current;
+			current = current->next;
+
+			efree(last);
+		}
+
+		if (buffer != NULL) {
+			efree(buffer);
+		}
+
+		ASYNC_RETURN_ON_ERROR();
 
 		return;
 	}
@@ -1105,6 +1107,8 @@ ZEND_METHOD(Socket, encrypt)
 	} else {
 		SSL_set_connect_state(socket->ssl);
 	}
+
+	SSL_set_mode(socket->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
 
 #ifdef SSL_MODE_RELEASE_BUFFERS
 	SSL_set_mode(socket->ssl, SSL_get_mode(socket->ssl) | SSL_MODE_RELEASE_BUFFERS);
