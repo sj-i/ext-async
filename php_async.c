@@ -273,6 +273,10 @@ static void async_gethostbyname_uv(char *name, zval *return_value, zend_execute_
 	zval result;
 	int err;
 
+	if (strcasecmp(name, "localhost") == 0) {
+		RETURN_STRING("127.0.0.1");
+	}
+
 	q = emalloc(sizeof(async_awaitable_queue));
 	ZEND_SECURE_ZERO(q, sizeof(async_awaitable_queue));
 

@@ -28,6 +28,10 @@
 #include <Mswsock.h>
 #include <psapi.h>
 #include <Iphlpapi.h>
+
+#undef HAVE_ASYNC_SSL
+#define HAVE_ASYNC_SSL 1
+
 #endif
 
 #ifdef HAVE_ASYNC_SSL
@@ -38,7 +42,6 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
-
 #endif
 
 #include "uv.h"
@@ -67,6 +70,10 @@ extern zend_module_entry async_module_entry;
 #include "zend_interfaces.h"
 #include "zend_exceptions.h"
 #include "zend_closures.h"
+
+#ifdef PHP_WIN32
+#include "win32/winutil.h"
+#endif
 
 #include "php_network.h"
 #include "php_streams.h"
@@ -655,13 +662,11 @@ struct _async_tcp_cert {
 	zend_string *file;
 	zend_string *key;
 	zend_string *passphrase;
-
+	async_tcp_cert *next;
+	async_tcp_cert *prev;
 #ifdef HAVE_ASYNC_SSL
 	SSL_CTX *ctx;
 #endif
-
-	async_tcp_cert *next;
-	async_tcp_cert *prev;
 };
 
 struct _async_tcp_cert_queue {

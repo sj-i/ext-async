@@ -1559,14 +1559,14 @@ static void async_tcp_server_object_destroy(zend_object *object)
 	if (server->ctx != NULL) {
 		SSL_CTX_free(server->ctx);
 	}
+
+	if (server->encryption != NULL) {
+		OBJ_RELEASE(&server->encryption->std);
+	}
 #endif
 
 	if (server->name != NULL) {
 		zend_string_release(server->name);
-	}
-
-	if (server->encryption != NULL) {
-		OBJ_RELEASE(&server->encryption->std);
 	}
 
 	zend_object_std_dtor(&server->std);
@@ -1597,9 +1597,9 @@ ZEND_METHOD(Server, listen)
 
 	async_gethostbyname(ZSTR_VAL(name), &ip, execute_data);
 
-	code = uv_ip4_addr(Z_STRVAL_P(&ip), (int) port, &bind);
-
 	ASYNC_RETURN_ON_ERROR();
+
+	code = uv_ip4_addr(Z_STRVAL_P(&ip), (int) port, &bind);
 
 	zval_ptr_dtor(&ip);
 
