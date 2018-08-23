@@ -196,7 +196,7 @@ static int ssl_check_san_names(async_tcp_socket *socket, X509 *cert, X509_STORE_
 	GENERAL_NAME *entry;
 
 	zend_string *peer_name;
-	char *cn;
+	unsigned char *cn;
 
 	int count;
 	int i;
@@ -214,9 +214,10 @@ static int ssl_check_san_names(async_tcp_socket *socket, X509 *cert, X509_STORE_
 			continue;
 		}
 
-		cn = (char *) ASN1_STRING_data(entry->d.dNSName);
+		ASN1_STRING_to_UTF8(&cn, entry->d.dNSName);
 
-		if ((size_t) ASN1_STRING_length(entry->d.dNSName) != strlen(cn)) {
+		if ((size_t) ASN1_STRING_length(entry->d.dNSName) != strlen((const char *) cn)) {
+			OPENSSL_free(cn);
 			break;
 		}
 
@@ -226,13 +227,16 @@ static int ssl_check_san_names(async_tcp_socket *socket, X509 *cert, X509_STORE_
 			peer_name = socket->name;
 		}
 
-		if (ssl_match_hostname(ZSTR_VAL(peer_name), cn)) {
-			GENERAL_NAMES_free(names);
+		if (ssl_match_hostname(ZSTR_VAL(peer_name), (const char *) cn)) {
+			OPENSSL_free(cn);
+			sk_GENERAL_NAME_pop_free(names, GENERAL_NAME_free);
 			return 1;
 		}
+
+		OPENSSL_free(cn);
 	}
 
-	GENERAL_NAMES_free(names);
+	sk_GENERAL_NAME_pop_free(names, GENERAL_NAME_free);
 
 	return 0;
 }
@@ -247,7 +251,7 @@ static int ssl_verify_callback(int preverify, X509_STORE_CTX *ctx)
 	X509_NAME_ENTRY *entry;
 	ASN1_STRING *str;
 
-	char *cn;
+	unsigned char *cn;
 
 	int depth;
 	int err;
@@ -290,9 +294,10 @@ static int ssl_verify_callback(int preverify, X509_STORE_CTX *ctx)
 			ASYNC_SSL_RETURN_VERIFY_ERROR(ctx);
 		}
 
-		cn = (char *) ASN1_STRING_data(str);
+		ASN1_STRING_to_UTF8(&cn, str);
 
-		if ((size_t) ASN1_STRING_length(str) != strlen(cn)) {
+		if ((size_t) ASN1_STRING_length(str) != strlen((const char *) cn)) {
+			OPENSSL_free(cn);
 			ASYNC_SSL_RETURN_VERIFY_ERROR(ctx);
 		}
 
@@ -302,9 +307,12 @@ static int ssl_verify_callback(int preverify, X509_STORE_CTX *ctx)
 			peer_name = socket->name;
 		}
 
-		if (!ssl_match_hostname(ZSTR_VAL(peer_name), cn)) {
+		if (!ssl_match_hostname(ZSTR_VAL(peer_name), (const char *) cn)) {
+			OPENSSL_free(cn);
 			ASYNC_SSL_RETURN_VERIFY_ERROR(ctx);
 		}
+
+		OPENSSL_free(cn);
 	}
 
 	return preverify;
