@@ -10,7 +10,7 @@ $socket = TcpSocket::connect('httpbin.org', $encryption ? 443 : 80, $encryption)
 try {
     var_dump($socket->getLocalPeer(), $socket->getRemotePeer());
     
-    $socket->nodelay(true);
+    $socket->setNodelay(true);
     
     if ($encryption) {
         $socket->encrypt();

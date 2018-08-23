@@ -185,6 +185,58 @@ static zend_bool ssl_match_hostname(const char *subjectname, const char *certnam
 	return strcasecmp(wildcard + 2, subjectname + subject_len - suffix_len);
 }
 
+#define ASYNC_SSL_RETURN_VERIFY_ERROR(ctx) do { \
+	X509_STORE_CTX_set_error(ctx, X509_V_ERR_APPLICATION_VERIFICATION); \
+	return 0; \
+} while (0);
+
+static int ssl_check_san_names(async_tcp_socket *socket, X509 *cert, X509_STORE_CTX *ctx)
+{
+	GENERAL_NAMES *names;
+	GENERAL_NAME *entry;
+
+	zend_string *peer_name;
+	char *cn;
+
+	int count;
+	int i;
+
+	names = X509_get_ext_d2i(cert, NID_subject_alt_name, 0, 0);
+
+	if (names == NULL) {
+		return 1;
+	}
+
+	for (count = sk_GENERAL_NAME_num(names), i = 0; i < count; i++) {
+		entry = sk_GENERAL_NAME_value(names, i);
+
+		if (entry == NULL || GEN_DNS != entry->type) {
+			continue;
+		}
+
+		cn = (char *) ASN1_STRING_data(entry->d.dNSName);
+
+		if ((size_t) ASN1_STRING_length(entry->d.dNSName) != strlen(cn)) {
+			break;
+		}
+
+		if (socket->encryption != NULL && socket->encryption->peer_name != NULL) {
+			peer_name = socket->encryption->peer_name;
+		} else {
+			peer_name = socket->name;
+		}
+
+		if (ssl_match_hostname(ZSTR_VAL(peer_name), cn)) {
+			GENERAL_NAMES_free(names);
+			return 1;
+		}
+	}
+
+	GENERAL_NAMES_free(names);
+
+	return 0;
+}
+
 static int ssl_verify_callback(int preverify, X509_STORE_CTX *ctx)
 {
 	async_tcp_socket *socket;
@@ -222,26 +274,26 @@ static int ssl_verify_callback(int preverify, X509_STORE_CTX *ctx)
 	}
 
 	if (depth == 0) {
+		if (ssl_check_san_names(socket, cert, ctx)) {
+			return preverify;
+		}
+
 		if ((i = X509_NAME_get_index_by_NID(X509_get_subject_name((X509 *) cert), NID_commonName, -1)) < 0) {
-			X509_STORE_CTX_set_error(ctx, X509_V_ERR_APPLICATION_VERIFICATION);
-			return 0;
+			ASYNC_SSL_RETURN_VERIFY_ERROR(ctx);
 		}
 
 		if (NULL == (entry = X509_NAME_get_entry(X509_get_subject_name((X509 *) cert), i))) {
-			X509_STORE_CTX_set_error(ctx, X509_V_ERR_APPLICATION_VERIFICATION);
-			return 0;
+			ASYNC_SSL_RETURN_VERIFY_ERROR(ctx);
 		}
 
 		if (NULL == (str = X509_NAME_ENTRY_get_data(entry))) {
-			X509_STORE_CTX_set_error(ctx, X509_V_ERR_APPLICATION_VERIFICATION);
-			return 0;
+			ASYNC_SSL_RETURN_VERIFY_ERROR(ctx);
 		}
 
 		cn = (char *) ASN1_STRING_data(str);
 
 		if ((size_t) ASN1_STRING_length(str) != strlen(cn)) {
-			X509_STORE_CTX_set_error(ctx, X509_V_ERR_APPLICATION_VERIFICATION);
-			return 0;
+			ASYNC_SSL_RETURN_VERIFY_ERROR(ctx);
 		}
 
 		if (socket->encryption != NULL && socket->encryption->peer_name != NULL) {
@@ -251,8 +303,7 @@ static int ssl_verify_callback(int preverify, X509_STORE_CTX *ctx)
 		}
 
 		if (!ssl_match_hostname(ZSTR_VAL(peer_name), cn)) {
-			X509_STORE_CTX_set_error(ctx, X509_V_ERR_APPLICATION_VERIFICATION);
-			return 0;
+			ASYNC_SSL_RETURN_VERIFY_ERROR(ctx);
 		}
 	}
 
@@ -756,7 +807,7 @@ ZEND_METHOD(Socket, close)
 	}
 }
 
-ZEND_METHOD(Socket, nodelay)
+ZEND_METHOD(Socket, setNodelay)
 {
 	async_tcp_socket *socket;
 
@@ -1237,7 +1288,7 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_tcp_socket_close, 0, 0, IS_VOID,
 	ZEND_ARG_OBJ_INFO(0, error, Throwable, 1)
 ZEND_END_ARG_INFO()
 
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_tcp_socket_nodelay, 0, 1, IS_VOID, 0)
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_tcp_socket_set_nodelay, 0, 1, IS_VOID, 0)
 	ZEND_ARG_TYPE_INFO(0, enable, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
@@ -1268,7 +1319,7 @@ static const zend_function_entry async_tcp_socket_functions[] = {
 	ZEND_ME(Socket, connect, arginfo_tcp_socket_connect, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
 	ZEND_ME(Socket, pair, arginfo_tcp_socket_pair, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
 	ZEND_ME(Socket, close, arginfo_tcp_socket_close, ZEND_ACC_PUBLIC)
-	ZEND_ME(Socket, nodelay, arginfo_tcp_socket_nodelay, ZEND_ACC_PUBLIC)
+	ZEND_ME(Socket, setNodelay, arginfo_tcp_socket_set_nodelay, ZEND_ACC_PUBLIC)
 	ZEND_ME(Socket, getLocalPeer, arginfo_tcp_socket_get_local_peer, ZEND_ACC_PUBLIC)
 	ZEND_ME(Socket, getRemotePeer, arginfo_tcp_socket_get_remote_peer, ZEND_ACC_PUBLIC)
 	ZEND_ME(Socket, read, arginfo_tcp_socket_read, ZEND_ACC_PUBLIC)

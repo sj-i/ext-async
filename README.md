@@ -300,7 +300,7 @@ final class TcpSocket implements DuplexStream
     
     public function close(?\Throwable $e = null): void { }
     
-    public function nodelay(bool $enable): void { }
+    public function setNodelay(bool $enable): void { }
     
     public function getLocalPeer(): array { }
     
